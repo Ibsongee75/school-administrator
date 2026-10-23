@@ -1,0 +1,10 @@
+
+{
+  "appId": "com.schooladministrator.app",
+  "appName": "School Administrator",
+  "webDir": "www",
+  "server": {
+    "url": "https://ibsongee75.github.io/student_report/",
+    "cleartext": false
+  }
+}
