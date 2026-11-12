@@ -146,6 +146,54 @@
     syncSoon();
   }
 
+  /* Insert-or-update many rows at once. Existing local rows are matched on the
+   * table's natural key (e.g. class + session + term + match_key), so a re-upload
+   * updates the same record instead of creating a duplicate. */
+  const keyOf = (r, fields) => fields.map(f => String(r[f] ?? '')).join('\u0001');
+
+  async function upsertManyByKey(table, keyFields, recs) {
+    if (!TABLES[table]) throw new Error('Not an offline table: ' + table);
+    const existing = new Map((await getAll(table)).map(r => [keyOf(r, keyFields), r]));
+    const rows = [];
+    const queue = [];
+    const nowIso = new Date().toISOString();
+    for (const rec of recs) {
+      const k = keyOf(rec, keyFields);
+      const old = existing.get(k);
+      const r = old ? { ...old, ...rec } : { ...rec };
+      if (TABLES[table].kind === 'uuid') {
+        r.id = (old && old.id) || r.id || uid();
+        r.client_id = r.id;
+      } else {
+        r.client_id = (old && old.client_id) || r.client_id || uid();
+        if (old && old.id !== undefined) r.id = old.id;
+      }
+      r.updated_at = nowIso;
+      r._dirty = true;
+      existing.set(k, r);              // duplicates inside one upload merge together
+      rows.push(r);
+      queue.push({ key: table + '|' + r.client_id, table, client_id: r.client_id, action: 'upsert', at: Date.now() });
+    }
+    await putMany(table, rows);
+    await putMany('outbox', queue);
+    emit('pending');
+    syncSoon();
+    return rows.length;
+  }
+
+  /* Delete every local row for which fn(row) is true, and queue the deletes. */
+  async function removeWhere(table, fn) {
+    if (!TABLES[table]) throw new Error('Not an offline table: ' + table);
+    const victims = (await getAll(table)).filter(fn);
+    for (const v of victims) await del(table, v.client_id);
+    await putMany('outbox', victims.map(v => ({
+      key: table + '|' + v.client_id, table, client_id: v.client_id, action: 'delete', at: Date.now(),
+    })));
+    emit('pending');
+    syncSoon();
+    return victims.length;
+  }
+
   /* ---------- sync ---------- */
   async function push() {
     const items = (await getAll('outbox')).sort((a, b) => a.at - b.at);
@@ -258,5 +306,5 @@
     sync();
   }
 
-  window.Offline = { init, list, save, remove, sync, clearAll, onStatus: fn => listeners.push(fn), pending: pendingCount };
+  window.Offline = { init, list, save, remove, upsertManyByKey, removeWhere, sync, clearAll, onStatus: fn => listeners.push(fn), pending: pendingCount };
 })();
