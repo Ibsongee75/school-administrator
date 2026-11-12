@@ -1,10 +1,5 @@
-
 {
   "appId": "com.schooladministrator.app",
   "appName": "School Administrator",
-  "webDir": "www",
-  "server": {
-    "url": "",
-    "cleartext": false
-  }
+  "webDir": "www"
 }
