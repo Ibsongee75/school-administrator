@@ -50,6 +50,13 @@ const supabaseClient =
 
 
 /* =========================================================
+   PAYSTACK
+   ========================================================= */
+
+const PAYSTACK_PUBLIC_KEY =
+    "pk_live_13f21f3e23bb881e317ecafcf21cf4f6acb76144";
+
+/* =========================================================
    OFFLINE START HELPERS
    Remember the signed-in user, subscription and staff role on
    this phone so the app can open without internet.
@@ -95,14 +102,6 @@ async function smBlockLogoutIfUnsynced() {
     }
     return false;
 }
-
-
-/* =========================================================
-   PAYSTACK
-   ========================================================= */
-
-const PAYSTACK_PUBLIC_KEY =
-    "pk_live_13f21f3e23bb881e317ecafcf21cf4f6acb76144";
 
 
 /* =========================================================
@@ -261,13 +260,26 @@ function reportSettingsForFingerprint() {
     delete copy.commentBank;
     /* Changing the report outlook must not make reports count as new. */
     delete copy.reportTemplate;
+    /* Neither must tagging subjects/classes with levels. */
+    delete copy.subjectLevels;
+    delete copy.classLevels;
     return copy;
+}
+
+/* Until levels are used the fingerprint keeps using the whole school list
+   (so reports already generated are not counted as new). Once levels are
+   used, a report is tied to the subjects this student actually has, so
+   adding a subject to another level never changes it. */
+function fingerprintSubjectsFor(student) {
+    if (!levelsInUse()) return schoolSubjects;
+    const detected = detectSubjectsFromRows([student]);
+    return detected.length > 0 ? detected : schoolSubjects;
 }
 
 function getReportGenerationFingerprint(student) {
     const payload = {
         student: stableValue(studentForFingerprint(student)),
-        subjects: stableValue(schoolSubjects),
+        subjects: stableValue(fingerprintSubjectsFor(student)),
         settings: stableValue(reportSettingsForFingerprint()),
         website: WEBSITE_ID
     };
@@ -726,6 +738,126 @@ const DEFAULT_SCHOOL_SUBJECTS = schoolSubjects.slice();
 
 
 /* =========================================================
+   SUBJECT LEVELS  (Pre Basic / Basic / Post Basic)
+
+   The school keeps ONE subject list. Each subject is tagged with
+   the level(s) it is taught at (reportSettings.subjectLevels) and each
+   class is tagged with its level (reportSettings.classLevels). A class
+   then only offers the subjects of its own level. Subjects or classes
+   with no level behave exactly as before (every subject / every class).
+
+   Both maps live inside reportSettings, so they are saved in the
+   browser and in Supabase (school_profile.report_settings) with no
+   database change.
+   ========================================================= */
+
+const SUBJECT_LEVELS = ["Pre Basic", "Basic", "Post Basic"];
+
+function getSubjectLevelMap() {
+    if (
+        !reportSettings.subjectLevels ||
+        typeof reportSettings.subjectLevels !== "object" ||
+        Array.isArray(reportSettings.subjectLevels)
+    ) {
+        reportSettings.subjectLevels = {};
+    }
+    return reportSettings.subjectLevels;
+}
+
+function getClassLevelMap() {
+    if (
+        !reportSettings.classLevels ||
+        typeof reportSettings.classLevels !== "object" ||
+        Array.isArray(reportSettings.classLevels)
+    ) {
+        reportSettings.classLevels = {};
+    }
+    return reportSettings.classLevels;
+}
+
+/* Levels a subject is taught at, in Pre Basic / Basic / Post Basic order. */
+function getSubjectLevels(subject) {
+    const stored = getSubjectLevelMap()[subject];
+    const levels = Array.isArray(stored) ? stored : [];
+    return SUBJECT_LEVELS.filter(function (level) {
+        return levels.indexOf(level) !== -1;
+    });
+}
+
+function setSubjectLevels(subject, levels) {
+    const map = getSubjectLevelMap();
+    const clean = SUBJECT_LEVELS.filter(function (level) {
+        return (levels || []).indexOf(level) !== -1;
+    });
+    if (clean.length) {
+        map[subject] = clean;
+    } else {
+        delete map[subject];
+    }
+}
+
+/* Subjects offered at a level (subjects with no level are offered everywhere). */
+function subjectsForLevel(level) {
+    return schoolSubjects.filter(function (subject) {
+        const levels = getSubjectLevels(subject);
+        return levels.length === 0 || levels.indexOf(level) !== -1;
+    });
+}
+
+function getClassLevel(className) {
+    const wanted = normalizeClassKey(className);
+    if (!wanted) return "";
+    const map = getClassLevelMap();
+    const key = Object.keys(map).find(function (name) {
+        return normalizeClassKey(name) === wanted;
+    });
+    const level = key ? map[key] : "";
+    return SUBJECT_LEVELS.indexOf(level) !== -1 ? level : "";
+}
+
+function setClassLevel(className, level) {
+    const wanted = normalizeClassKey(className);
+    if (!wanted) return;
+    const map = getClassLevelMap();
+    Object.keys(map).forEach(function (name) {
+        if (normalizeClassKey(name) === wanted) delete map[name];
+    });
+    if (SUBJECT_LEVELS.indexOf(level) !== -1) {
+        map[className] = level;
+    }
+}
+
+/* The subjects a class works with: its level's subjects, or every
+   subject when the class has no level yet. */
+function subjectsForClass(className) {
+    const level = getClassLevel(className);
+    return level ? subjectsForLevel(level) : schoolSubjects.slice();
+}
+
+function levelsInUse() {
+    return (
+        Object.keys(getSubjectLevelMap()).length > 0 ||
+        Object.keys(getClassLevelMap()).length > 0
+    );
+}
+
+/* Adds subjects found in an uploaded file to the school list WITHOUT
+   dropping the school's other subjects (a class's file only holds its
+   own level's subjects, so replacing the list would wipe the rest). */
+function mergeDetectedSubjects(detected) {
+    let added = false;
+    (detected || []).forEach(function (name) {
+        const clean = String(name || "").trim();
+        if (clean && schoolSubjects.indexOf(clean) === -1) {
+            schoolSubjects.push(clean);
+            added = true;
+        }
+    });
+    return added;
+}
+
+
+/* =========================================================
    BEHAVIORAL TRAITS
    ========================================================= */
 
@@ -780,7 +912,17 @@ let reportSettings = {
         40,
 
     gradeF:
-        0
+        0,
+
+    /* Subject levels: { "Mathematics": ["Pre Basic", "Basic"] }.
+       A subject with no entry is treated as available to every level. */
+    subjectLevels:
+        {},
+
+    /* Class levels: { "JSS 1": "Basic" }. A class with no entry uses
+       every subject, exactly as before levels existed. */
+    classLevels:
+        {}
 
 };
 
@@ -1666,7 +1808,7 @@ function initializeCollapsibleSections() {
     /* Manage Classes */
     safely(function () {
         srgCollapsibleBlock(
-            ["newClassNameInput", "addClassButton", "classManagerStatus", "classListContainer"].map(byId),
+            ["newClassNameInput", "classLevelRow", "addClassButton", "classManagerStatus", "classListContainer"].map(byId),
             "Manage Classes",
             SRG_PROTECTED
         );
@@ -3318,12 +3460,12 @@ function scheduleSchoolProfileSync() {
    - Pictures are resized to a small thumbnail on the phone and saved
      to the school account, so they appear in the browser AND in the
      Android app.
-   - A picture is matched to a student by its FILE NAME: the
-     student's admission number (2024-015.jpg) or full name
-     (Ada Obi.jpg). Capitals, punctuation and name order do not
-     matter.
-   - Only the school owner and the form master can add or delete
-     pictures. Other approved staff can only see them.
+   - Photos are added one student at a time from the Student Passport
+     Photos section (Add Photo / Change Photo / Remove), for the class
+     chosen in Step 1A. Earlier pictures saved by file name still match
+     their students (admission number or full name).
+   - Only the school owner and the form master can add, change or
+     remove pictures. Other approved staff can only see them.
    - Pictures that were saved earlier in this browser only (the old
      IndexedDB store) are moved to the account once, automatically.
    - On the report sheet the picture sits at the right corner of the
@@ -3768,145 +3910,216 @@ function studentPhotoLayout(admissionNo, studentName) {
 
 }
 
-function updateStudentPhotoStatus(extra) {
+/* =========================================================
+   STUDENT PHOTO MANAGER  (same screen as the reportgen1 website)
 
-    const el = document.getElementById("studentPhotoStatus");
+   Lists the students of the class chosen in Step 1A. Each student has
+   an Add Photo / Change Photo button and, once a photo is saved, a
+   Remove button. Photos are saved to the school account.
+   ========================================================= */
 
-    if (!el) return;
+let studentPhotoManager = null;
+let studentPhotoStatus = null;
+let studentPhotoEventsAttached = false;
 
-    const count = Object.keys(studentPhotoMap).length;
+const STUDENT_PHOTO_MAX_FILE_BYTES = 8 * 1024 * 1024;
 
-    let text = count + " picture(s) saved in your school account.";
+/* The key a new photo is saved under: the admission number when the
+   student has one, otherwise the name. These are the same keys used
+   before, so pictures saved earlier keep matching their students. */
+function studentPhotoSaveKey(admissionNo, studentName) {
+    return photoKeyFor(admissionNo) || photoKeyFor(studentName);
+}
 
-    if (Array.isArray(students) && students.length > 0) {
+/* Every key a student's picture could be stored under. */
+function studentPhotoAllKeys(admissionNo, studentName) {
+    const keys = [];
+    [photoKeyFor(admissionNo), photoKeyFor(studentName)].forEach(function (key) {
+        if (key && keys.indexOf(key) === -1) keys.push(key);
+    });
+    return keys;
+}
 
-        const named = students.filter(function (s) {
-            return String(s["Student Name"] || "").trim() !== "";
-        });
+async function deleteStudentPhotoKeys(keys) {
 
-        const missing = named.filter(function (s) {
-            return !findStudentPhoto(s["Admission No"], s["Student Name"]);
-        });
+    if (!currentUserId) throw new Error("Please sign in first.");
 
-        if (named.length > 0) {
-            text += " " + (named.length - missing.length) + " of " + named.length +
-                    " student(s) in the uploaded master file have a picture.";
+    if (!keys.length) return;
 
-            if (missing.length > 0 && missing.length <= 12) {
-                text += " No picture yet: " + missing.map(function (s) {
-                    return String(s["Student Name"]).trim();
-                }).join(", ") + ".";
-            }
-        }
+    const { error } = await supabaseClient
+        .from(STUDENT_PHOTO_TABLE)
+        .delete()
+        .eq("owner_user_id", currentUserId)
+        .eq("website_id", WEBSITE_ID)
+        .in("photo_key", keys);
 
-    }
+    if (error) throw error;
 
-    el.textContent = (extra ? extra + " " : "") + text;
+    keys.forEach(function (key) { delete studentPhotoMap[key]; });
 
 }
 
-async function handlePhotoUpload() {
+/* Kept under its old name: loading, saving and the one-time moves all
+   call it. It now just redraws the photo manager. */
+function updateStudentPhotoStatus() {
 
-    const input = document.getElementById("studentPhotoInput");
-    const button = document.getElementById("saveStudentPhotosButton");
+    renderStudentPhotoManager();
 
-    if (!canEditStudentPhotos()) {
-        alert("Only the school owner or the form master can add student pictures.");
+}
+
+function renderStudentPhotoManager() {
+
+    if (!studentPhotoManager) {
+        studentPhotoManager = document.getElementById("studentPhotoManager");
+    }
+
+    if (!studentPhotoManager) return;
+
+    if (!Array.isArray(classRoster) || !classRoster.length) {
+        studentPhotoManager.innerHTML =
+            "<em>Upload a class list first. Photos are saved to your school account.</em>";
         return;
     }
 
-    if (!input || !input.files || input.files.length === 0) {
-        alert("Please choose one or more pictures first.");
-        return;
+    const canEdit = canEditStudentPhotos();
+
+    let html = "";
+
+    if (studentPhotoNotice) {
+        html += "<p style=\"margin:0 0 8px;\"><small>" + escapeHTML(studentPhotoNotice) + "</small></p>";
     }
 
-    const files = Array.prototype.slice.call(input.files);
-    const status = document.getElementById("studentPhotoStatus");
+    html += "<div style=\"display:grid;gap:10px;\">";
 
-    if (button) button.disabled = true;
+    classRoster.forEach(function (student, index) {
 
-    let saved = 0;
-    let firstError = "";
-    const skipped = [];
+        const photo = findStudentPhoto(student.admission_no, student.student_name) || "";
 
-    try {
+        html += "<div style=\"display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding:9px;border:1px solid #e2e2e2;border-radius:7px;background:#fff;\">";
+        html += "<div style=\"width:48px;height:60px;display:flex;align-items:center;justify-content:center;border:1px solid #ccc;border-radius:4px;overflow:hidden;background:#f5f5f5;\">";
+        html += photo
+            ? "<img src=\"" + escapeHTML(photo) + "\" alt=\"Student photo\" style=\"width:100%;height:100%;object-fit:cover;\">"
+            : "<span style=\"font-size:22px;\">👤</span>";
+        html += "</div><div style=\"flex:1;min-width:180px;\"><strong>" + escapeHTML(student.student_name) + "</strong>";
+        if (student.admission_no) html += "<br><small>" + escapeHTML(student.admission_no) + "</small>";
+        html += "</div>";
 
-        for (let i = 0; i < files.length; i++) {
-
-            const file = files[i];
-
-            if (status) status.textContent = "⏳ Saving pictures… " + i + " / " + files.length;
-
-            const baseName = file.name.replace(/\.[^.]+$/, "");
-            const key = photoKeyFor(baseName);
-
-            if (!key || !/^image\//.test(file.type || "image/")) {
-                skipped.push(file.name);
-                continue;
+        if (canEdit) {
+            html += "<label style=\"margin:0;\"><span style=\"display:inline-block;padding:7px 10px;border:1px solid #bbb;border-radius:5px;cursor:pointer;background:#f8f8f8;\">📷 " +
+                (photo ? "Change Photo" : "Add Photo") +
+                "</span><input type=\"file\" accept=\"image/jpeg,image/png,image/webp\" data-student-photo-index=\"" + index + "\" style=\"display:none;\"></label>";
+            if (photo) {
+                html += "<button type=\"button\" data-remove-student-photo=\"" + index + "\">Remove</button>";
             }
-
-            try {
-                const dataUrl = await makePhotoThumbnail(file);
-                await saveStudentPhoto(key, dataUrl, file.name);
-                saved++;
-            } catch (error) {
-                console.error("Could not save picture " + file.name + ":", error);
-                if (!firstError) firstError = (error && error.message) || "unknown error";
-                skipped.push(file.name);
-            }
-
         }
 
-        input.value = "";
+        html += "</div>";
 
-        let message = "✅ Saved " + saved + " picture(s).";
+    });
 
-        if (skipped.length > 0) {
-            message += " ⚠️ Skipped " + skipped.length + ": " +
-                       skipped.slice(0, 5).join(", ") + (skipped.length > 5 ? "…" : "") + ".";
-        }
+    html += "</div>";
 
-        if (saved === 0 && firstError) {
-            message = "❌ Could not save the pictures: " + firstError;
-        }
-
-        updateStudentPhotoStatus(message);
-
-    } finally {
-
-        if (button) button.disabled = false;
-
-    }
+    studentPhotoManager.innerHTML = html;
 
 }
 
 function attachStudentPhotoEvents() {
 
-    const saveButton = document.getElementById("saveStudentPhotosButton");
-    const clearButton = document.getElementById("clearStudentPhotosButton");
+    studentPhotoManager = document.getElementById("studentPhotoManager");
+    studentPhotoStatus = document.getElementById("studentPhotoStatus");
 
-    if (saveButton) saveButton.addEventListener("click", handlePhotoUpload);
+    if (!studentPhotoManager || studentPhotoEventsAttached) return;
 
-    if (clearButton) {
-        clearButton.addEventListener("click", async function () {
+    studentPhotoEventsAttached = true;
 
-            if (!canEditStudentPhotos()) {
-                alert("Only the school owner or the form master can delete student pictures.");
-                return;
+    studentPhotoManager.addEventListener("change", async function (event) {
+
+        const input = event.target.closest("input[data-student-photo-index]");
+
+        if (!input || !input.files || !input.files[0]) return;
+
+        const student = classRoster[Number(input.getAttribute("data-student-photo-index"))];
+
+        if (!student) return;
+
+        const file = input.files[0];
+
+        input.value = "";
+
+        if (!canEditStudentPhotos()) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Only the school owner or the form master can change student photos.";
+            return;
+        }
+
+        if (!/^image\/(jpeg|png|webp)$/i.test(file.type)) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please select a JPG, PNG or WebP image.";
+            return;
+        }
+
+        if (file.size > STUDENT_PHOTO_MAX_FILE_BYTES) {
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "❌ Please use a photo smaller than 8 MB.";
+            return;
+        }
+
+        if (studentPhotoStatus) studentPhotoStatus.textContent = "⏳ Saving photo…";
+
+        try {
+
+            const small = await makePhotoThumbnail(file);
+
+            await saveStudentPhoto(
+                studentPhotoSaveKey(student.admission_no, student.student_name),
+                small,
+                file.name
+            );
+
+            renderStudentPhotoManager();
+
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "✅ Photo saved to your school account.";
+
+        } catch (error) {
+
+            console.error("Save student photo error:", error);
+
+            if (studentPhotoStatus) {
+                studentPhotoStatus.textContent = "❌ " + ((error && error.message) || "Could not process that photo.");
             }
 
-            if (!confirm("Delete ALL saved student pictures from your school account? This cannot be undone.")) return;
+        }
 
-            try {
-                await deleteAllStudentPhotos();
-                updateStudentPhotoStatus("🗑️ All pictures deleted.");
-            } catch (error) {
-                console.error(error);
-                updateStudentPhotoStatus("❌ Could not delete the pictures.");
+    });
+
+    studentPhotoManager.addEventListener("click", async function (event) {
+
+        const button = event.target.closest("[data-remove-student-photo]");
+
+        if (!button) return;
+
+        const student = classRoster[Number(button.getAttribute("data-remove-student-photo"))];
+
+        if (!student || !canEditStudentPhotos()) return;
+
+        try {
+
+            await deleteStudentPhotoKeys(
+                studentPhotoAllKeys(student.admission_no, student.student_name)
+            );
+
+            renderStudentPhotoManager();
+
+            if (studentPhotoStatus) studentPhotoStatus.textContent = "✅ Photo removed.";
+
+        } catch (error) {
+
+            console.error("Delete student photo error:", error);
+
+            if (studentPhotoStatus) {
+                studentPhotoStatus.textContent = "❌ " + ((error && error.message) || "The photo was not removed.");
             }
 
-        });
-    }
+        }
+
+    });
 
 }
 
@@ -4076,6 +4289,7 @@ async function loadStaffMembership(user) {
 
 async function loadStaffMembershipOnline(user) {
 
+
     const { data, error } = await supabaseClient
         .from("school_staff")
         .select("owner_user_id, status, full_name")
@@ -4126,7 +4340,10 @@ async function loadStaffMembershipOnline(user) {
 /* Subjects the Step 1B dropdown may offer. */
 function subjectOptionsForCurrentUser() {
 
-    if (!staffContext) return schoolSubjects;
+    if (!staffContext) {
+        const activeClass = getActiveClassName(false);
+        return activeClass ? subjectsForClass(activeClass) : schoolSubjects;
+    }
 
     const className = getActiveClassName(false);
     const list = [];
@@ -6706,10 +6923,21 @@ if (backToAppButton) {
                         ? newClassNameInput.value
                         : "";
 
-                const added = await addSchoolClass(name);
+                const levelSelect =
+                    document.getElementById("newClassLevelSelect");
+
+                const level = levelSelect ? levelSelect.value : "";
+
+                if (levelSelect && name.trim() && !level) {
+                    alert("Please select the class level (Pre Basic, Basic or Post Basic).");
+                    return;
+                }
+
+                const added = await addSchoolClass(name, level);
 
                 if (added && elementExists(newClassNameInput)) {
                     newClassNameInput.value = "";
+                    if (levelSelect) levelSelect.value = "";
                 }
 
             }
@@ -6723,6 +6951,33 @@ if (backToAppButton) {
             classListContainer
         )
     ) {
+
+        classListContainer.addEventListener(
+            "change",
+            function (event) {
+
+                const select = event.target.closest(
+                    "[data-class-level-for]"
+                );
+
+                if (!select) return;
+
+                const className = select.getAttribute("data-class-level-for");
+
+                setClassLevel(className, select.value);
+                saveAppData();
+
+                if (elementExists(classManagerStatus)) {
+                    classManagerStatus.textContent = select.value
+                        ? "✅ \"" + className + "\" is now " + select.value + "."
+                        : "Level cleared for \"" + className + "\" - it will use every subject.";
+                }
+
+                /* Refresh the class dropdown labels and the subject list. */
+                populateClassNameSelect();
+
+            }
+        );
 
         classListContainer.addEventListener(
             "click",
@@ -6946,13 +7201,22 @@ function createSubjectManager() {
         </h2>
 
         <p>
-            Add or remove subjects before downloading
-            the Excel template.
+            Pick a level (Pre Basic, Basic or Post Basic), then add the
+            subjects taught at that level. Each class uses the subjects of
+            its own level, which you choose in Manage Classes. A subject
+            taught at more than one level can be added to each of them, and
+            renaming it renames it in every level.
         </p>
 
         <div id="subjectList"></div>
 
-        <div style="margin-top:10px;">
+        <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:8px; align-items:center;">
+
+            <select id="newSubjectLevelSelect">
+                ${SUBJECT_LEVELS.map(function (level) {
+                    return '<option value="' + level + '">' + level + '</option>';
+                }).join("")}
+            </select>
 
             <input
                 type="text"
@@ -7030,8 +7294,15 @@ function createSubjectManager() {
                 }
 
 
+                const levelSelect =
+                    document.getElementById(
+                        "newSubjectLevelSelect"
+                    );
+
+
                 addSubject(
-                    subject
+                    subject,
+                    levelSelect ? levelSelect.value : ""
                 );
 
 
@@ -7057,70 +7328,84 @@ function renderSubjectList() {
             "subjectList"
         );
 
-
     if (!list) {
 
         return;
 
     }
 
+    const rowHtml = function (subject, level) {
 
-    list.innerHTML =
-        "";
-
-
-    schoolSubjects.forEach(
-        function (
-            subject,
-            index
-        ) {
-
-            const item =
-                document.createElement(
-                    "div"
+        const assignButtons = level
+            ? ""
+            : SUBJECT_LEVELS.map(function (target) {
+                return (
+                    '<button type="button" data-assign-subject="' + escapeHTML(subject) +
+                    '" data-assign-level="' + escapeHTML(target) + '">' +
+                    escapeHTML(target) + '</button>'
                 );
+            }).join("");
 
+        return (
+            '<div style="display:flex; align-items:center; gap:8px; margin-bottom:6px; flex-wrap:wrap;">' +
+            '<input type="text" class="subject-name-input" style="flex:1; min-width:140px;" value="' +
+            escapeHTML(subject) + '" data-subject-name="' + escapeHTML(subject) + '">' +
+            assignButtons +
+            '<button type="button" data-remove-subject="' + escapeHTML(subject) +
+            '" data-remove-level="' + escapeHTML(level) + '">Remove</button>' +
+            '</div>'
+        );
 
-            item.style.display =
-                "flex";
+    };
 
-            item.style.alignItems =
-                "center";
+    const groupHtml = function (title, note, rows) {
 
-            item.style.gap =
-                "8px";
+        return (
+            '<div style="margin:12px 0;">' +
+            '<div style="font-weight:700; margin-bottom:6px;">' + escapeHTML(title) +
+            ' <span style="font-weight:400; opacity:0.7;">(' + rows.length + ')</span></div>' +
+            (note ? '<p style="opacity:0.7; margin:0 0 6px;">' + escapeHTML(note) + '</p>' : "") +
+            (rows.length
+                ? rows.join("")
+                : '<p style="opacity:0.7; margin:0 0 6px;">No subjects added for this level yet.</p>') +
+            '</div>'
+        );
 
-            item.style.marginBottom =
-                "6px";
+    };
 
+    let html = "";
 
-            item.innerHTML = `
+    SUBJECT_LEVELS.forEach(function (level) {
 
-                <input
-                    type="text"
-                    value="${escapeHTML(subject)}"
-                    data-subject-index="${index}"
-                    class="subject-name-input"
-                    style="flex:1;"
-                >
+        const rows = schoolSubjects
+            .filter(function (subject) {
+                return getSubjectLevels(subject).indexOf(level) !== -1;
+            })
+            .map(function (subject) {
+                return rowHtml(subject, level);
+            });
 
-                <button
-                    type="button"
-                    data-remove-subject="${index}"
-                >
-                    Remove
-                </button>
+        html += groupHtml(level, "", rows);
 
-            `;
+    });
 
+    const unassigned = schoolSubjects.filter(function (subject) {
+        return getSubjectLevels(subject).length === 0;
+    });
 
-            list.appendChild(
-                item
-            );
+    if (unassigned.length > 0) {
 
-        }
-    );
+        html += groupHtml(
+            "Not assigned to a level yet",
+            "These are offered to every class until you tap a level to assign them.",
+            unassigned.map(function (subject) {
+                return rowHtml(subject, "");
+            })
+        );
 
+    }
+
+    list.innerHTML = html;
 
     list.querySelectorAll(
         ".subject-name-input"
@@ -7132,77 +7417,16 @@ function renderSubjectList() {
                     "change",
                     function () {
 
-                        const index =
-                            Number(
-                                input.dataset
-                                    .subjectIndex
-                            );
-
-
-                        const newName =
-                            input.value.trim();
-
-
-                        if (!newName) {
-
-                            alert(
-                                "Subject name cannot be empty."
-                            );
-
-                            renderSubjectList();
-
-                            return;
-
-                        }
-
-
-                        const duplicate =
-                            schoolSubjects.some(
-                                function (
-                                    subject,
-                                    subjectIndex
-                                ) {
-
-                                    return (
-
-                                        subjectIndex !==
-                                        index &&
-
-                                        subject.toLowerCase() ===
-                                        newName.toLowerCase()
-
-                                    );
-
-                                }
-                            );
-
-
-                        if (duplicate) {
-
-                            alert(
-                                "This subject already exists."
-                            );
-
-                            renderSubjectList();
-
-                            return;
-
-                        }
-
-
-                        schoolSubjects[index] =
-                            newName;
-
-
-                        markSubjectListChanged();
-                        saveAppData();
+                        renameSubject(
+                            input.getAttribute("data-subject-name"),
+                            input.value.trim()
+                        );
 
                     }
                 );
 
             }
         );
-
 
     list.querySelectorAll(
         "[data-remove-subject]"
@@ -7214,23 +7438,31 @@ function renderSubjectList() {
                     "click",
                     function () {
 
-                        const index =
-                            Number(
-                                button.dataset
-                                    .removeSubject
-                            );
-
-
-                        schoolSubjects.splice(
-                            index,
-                            1
+                        removeSubjectFromLevel(
+                            button.getAttribute("data-remove-subject"),
+                            button.getAttribute("data-remove-level")
                         );
 
+                    }
+                );
 
-                        renderSubjectList();
+            }
+        );
 
-                        markSubjectListChanged();
-                        saveAppData();
+    list.querySelectorAll(
+        "[data-assign-subject]"
+    )
+        .forEach(
+            function (button) {
+
+                button.addEventListener(
+                    "click",
+                    function () {
+
+                        assignSubjectToLevel(
+                            button.getAttribute("data-assign-subject"),
+                            button.getAttribute("data-assign-level")
+                        );
 
                     }
                 );
@@ -7239,6 +7471,125 @@ function renderSubjectList() {
         );
 
     populateSubjectTemplateSelect();
+
+}
+
+function subjectListEdited() {
+
+    renderSubjectList();
+
+    markSubjectListChanged();
+    saveAppData();
+
+}
+
+function renameSubject(oldName, newName) {
+
+    if (!newName) {
+
+        alert(
+            "Subject name cannot be empty."
+        );
+
+        renderSubjectList();
+
+        return;
+
+    }
+
+    if (newName === oldName) {
+
+        return;
+
+    }
+
+    const duplicate =
+        schoolSubjects.some(
+            function (subject) {
+
+                return (
+                    subject !== oldName &&
+                    subject.toLowerCase() === newName.toLowerCase()
+                );
+
+            }
+        );
+
+    if (duplicate) {
+
+        alert(
+            "This subject already exists."
+        );
+
+        renderSubjectList();
+
+        return;
+
+    }
+
+    const index = schoolSubjects.indexOf(oldName);
+
+    if (index === -1) {
+
+        renderSubjectList();
+
+        return;
+
+    }
+
+    schoolSubjects[index] = newName;
+
+    const map = getSubjectLevelMap();
+
+    if (Object.prototype.hasOwnProperty.call(map, oldName)) {
+
+        map[newName] = map[oldName];
+
+        delete map[oldName];
+
+    }
+
+    subjectListEdited();
+
+}
+
+function removeSubjectFromLevel(subject, level) {
+
+    const remaining = level
+        ? getSubjectLevels(subject).filter(function (existing) {
+            return existing !== level;
+        })
+        : [];
+
+    if (remaining.length > 0) {
+
+        /* Still taught at another level: only leave this one. */
+        setSubjectLevels(subject, remaining);
+
+    } else {
+
+        const index = schoolSubjects.indexOf(subject);
+
+        if (index !== -1) schoolSubjects.splice(index, 1);
+
+        delete getSubjectLevelMap()[subject];
+
+    }
+
+    subjectListEdited();
+
+}
+
+function assignSubjectToLevel(subject, level) {
+
+    if (SUBJECT_LEVELS.indexOf(level) === -1) return;
+
+    setSubjectLevels(
+        subject,
+        getSubjectLevels(subject).concat([level])
+    );
+
+    subjectListEdited();
 
 }
 
@@ -7364,7 +7715,10 @@ function updateContextBanners() {
 
     document.querySelectorAll(".context-banner").forEach(function (banner) {
         const annual = banner.getAttribute("data-context") === "annual";
-        banner.textContent = contextLabel(context, !annual);
+        const bannerLevel =
+            context && context.className ? getClassLevel(context.className) : "";
+        banner.textContent =
+            contextLabel(context, !annual) + (bannerLevel ? " | " + bannerLevel : "");
     });
 
 }
@@ -8011,6 +8365,7 @@ async function fetchAttendanceRows(className, session, term) {
             };
         });
     }
+
 
     const baseColumns = "admission_no, student_name, match_key, days_present, days_opened, updated_at";
 
@@ -9348,7 +9703,7 @@ async function fetchClassRoster(className, session) {
     });
 
     if (localRoster.length || smIsOffline()) {
-        const mappedRoster = localRoster.map(function (row) {
+        return localRoster.map(function (row) {
             return {
                 admission_no: String(row.admission_no || "").trim(),
                 student_name: cleanStudentName(row.student_name),
@@ -9356,8 +9711,6 @@ async function fetchClassRoster(className, session) {
                 house: String(row.house || "").trim()
             };
         });
-        rosterCache[className + "|" + session] = mappedRoster.slice();
-        return mappedRoster;
     }
 
     const { data, error } = await withTimeout(
@@ -9405,6 +9758,9 @@ async function fetchClassRoster(className, session) {
 
 /* Step 1B: show the students of the selected class. */
 function renderStudentPreview() {
+
+    /* The photo list follows the same class list. */
+    renderStudentPhotoManager();
 
     if (!elementExists(studentPreviewContainer)) return;
 
@@ -9611,7 +9967,9 @@ async function downloadClassListTemplate() {
         /* Already-saved students are pre-filled so the form master can add to the list. */
         const existing = await fetchClassRoster(context.className, context.session);
 
-        const data = [["Admission No", "Student Name", "Gender", "House", "Class", "Session"]];
+        const classLevelName = getClassLevel(context.className);
+
+        const data = [["Admission No", "Student Name", "Gender", "House", "Class", "Session", "Level"]];
 
         for (let i = 0; i < TEMPLATE_STUDENT_ROWS; i++) {
             const student = existing[i];
@@ -9621,7 +9979,8 @@ async function downloadClassListTemplate() {
                 student ? student.gender : "",
                 student ? student.house : "",
                 context.className,
-                context.session
+                context.session,
+                classLevelName
             ]);
         }
 
@@ -9633,7 +9992,7 @@ async function downloadClassListTemplate() {
         }
 
         sheet["!cols"] = [
-            { wch: 9 }, { wch: 13 }, { wch: 8 }, { wch: 9 }, { wch: 10 }, { wch: 10 }
+            { wch: 9 }, { wch: 13 }, { wch: 8 }, { wch: 9 }, { wch: 10 }, { wch: 10 }, { wch: 11 }
         ];
         sheet["!freeze"] = { xSplit: 2, ySplit: 1 };
 
@@ -10673,44 +11032,59 @@ function populateSubjectTemplateSelect() {
    ========================================================= */
 
 function addSubject(
-    subject
+    subject,
+    level
 ) {
 
-    const exists =
-        schoolSubjects.some(
-            function (existing) {
+    const chosenLevel =
+        SUBJECT_LEVELS.indexOf(level) !== -1 ? level : "";
+
+    const existing =
+        schoolSubjects.find(
+            function (name) {
 
                 return (
-
-                    existing.toLowerCase() ===
+                    name.toLowerCase() ===
                     subject.toLowerCase()
-
                 );
 
             }
         );
 
+    if (existing) {
 
-    if (exists) {
+        const levels = getSubjectLevels(existing);
 
-        alert(
-            "This subject already exists."
+        if (!chosenLevel || levels.indexOf(chosenLevel) !== -1) {
+
+            alert(
+                chosenLevel
+                    ? "\"" + existing + "\" is already in " + chosenLevel + "."
+                    : "This subject already exists."
+            );
+
+            return;
+
+        }
+
+        /* Same subject taught at another level: just tag it. */
+        setSubjectLevels(existing, levels.concat([chosenLevel]));
+
+    } else {
+
+        schoolSubjects.push(
+            subject
         );
 
-        return;
+        if (chosenLevel) {
+
+            setSubjectLevels(subject, [chosenLevel]);
+
+        }
 
     }
 
-
-    schoolSubjects.push(
-        subject
-    );
-
-
-    renderSubjectList();
-
-    markSubjectListChanged();
-    saveAppData();
+    subjectListEdited();
 
 }
 
@@ -10839,12 +11213,15 @@ async function fetchSchoolClasses() {
     if (error) {
         console.error("Fetch school classes error:", error);
 
+
         /* Offline (or server unreachable): use the copy saved on this phone. */
         classRows = (await Offline.list(SCHOOL_CLASSES_TABLE, function (r) {
             return r.user_id === currentUserId && r.website_id === WEBSITE_ID;
         })).sort(function (a, b) {
             return String(a.class_name).localeCompare(String(b.class_name));
         });
+
+        if (!classRows.length) return;
 
         if (!classRows.length) return;
     }
@@ -10856,7 +11233,7 @@ async function fetchSchoolClasses() {
 
 }
 
-async function addSchoolClass(rawName) {
+async function addSchoolClass(rawName, level) {
 
     const cleaned = cleanStudentName(rawName);
 
@@ -10902,8 +11279,14 @@ async function addSchoolClass(rawName) {
         return false;
     }
 
+    if (SUBJECT_LEVELS.indexOf(level) !== -1) {
+        setClassLevel(cleaned, level);
+        saveAppData();
+    }
+
     if (elementExists(classManagerStatus)) {
-        classManagerStatus.textContent = "✅ Added \"" + cleaned + "\".";
+        classManagerStatus.textContent =
+            "✅ Added \"" + cleaned + "\"" + (level ? " (" + level + ")." : ".");
     }
 
     await fetchSchoolClasses();
@@ -10958,9 +11341,19 @@ function renderClassList() {
     }
 
     classListContainer.innerHTML = schoolClasses.map(function (schoolClass) {
+        const currentLevel = getClassLevel(schoolClass.class_name);
+        const levelOptions =
+            "<option value=\"\">Level not set</option>" +
+            SUBJECT_LEVELS.map(function (level) {
+                return "<option value=\"" + escapeHTML(level) + "\"" +
+                    (level === currentLevel ? " selected" : "") + ">" +
+                    escapeHTML(level) + "</option>";
+            }).join("");
         return (
-            "<div style=\"display:flex; align-items:center; gap:8px; margin-top:4px;\">" +
+            "<div style=\"display:flex; align-items:center; gap:8px; margin-top:4px; flex-wrap:wrap;\">" +
             "<span>" + escapeHTML(schoolClass.class_name) + "</span>" +
+            "<select data-class-level-for=\"" + escapeHTML(schoolClass.class_name) + "\">" +
+            levelOptions + "</select>" +
             "<button type=\"button\" data-remove-class-id=\"" + escapeHTML(String(schoolClass.id)) +
             "\" data-remove-class-name=\"" + escapeHTML(schoolClass.class_name) + "\">Remove</button>" +
             "</div>"
@@ -10980,8 +11373,10 @@ function populateClassNameSelect() {
 
     schoolClasses.forEach(function (schoolClass) {
         const option = document.createElement("option");
+        const classLevel = getClassLevel(schoolClass.class_name);
         option.value = schoolClass.class_name;
-        option.textContent = schoolClass.class_name;
+        option.textContent =
+            schoolClass.class_name + (classLevel ? " (" + classLevel + ")" : "");
         classNameInput.appendChild(option);
     });
 
@@ -11059,6 +11454,7 @@ function createCumulativeReport(student, model) {
                 }).join("")}
                 <td><strong>${formatCumulativeNumber(row.cumulative)}</strong></td>
                 <td>${row.cumulative === null ? "" : getGrade(row.cumulative)}</td>
+                <td class="remark-cell">${row.cumulative === null ? "" : escapeHTML(getGradeRemark(getGrade(row.cumulative)))}</td>
             </tr>
         `;
     }).join("");
@@ -11099,6 +11495,7 @@ function createCumulativeReport(student, model) {
                         <th>Third<br>Term</th>
                         <th>Cumulative</th>
                         <th>Grade</th>
+                        <th>Remark</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -11112,6 +11509,7 @@ function createCumulativeReport(student, model) {
                         }).join("")}
                         <th>${formatCumulativeNumber(average)}</th>
                         <th>${average === null ? "" : getGrade(average)}</th>
+                        <th>${average === null ? "" : escapeHTML(getGradeRemark(getGrade(average)))}</th>
                     </tr>
                 </tfoot>
             </table>
@@ -11129,6 +11527,8 @@ function createCumulativeReport(student, model) {
 
                 ${cumulativePhotoLayout.html}
             </div>
+
+            ${gradeKeyHtml(average === null ? "" : getGrade(average))}
 
             <div class="comments">
                 <p><strong>Class Teacher's Comment &amp; Signature:</strong></p>
@@ -11712,6 +12112,7 @@ function buildMetaSheet(className, subject, session, term) {
         ["subject", subject || ""],
         ["session", session || ""],
         ["term", term || ""],
+        ["level", getClassLevel(className)],
         ["generated_at", new Date().toISOString()]
     ];
 
@@ -11737,7 +12138,7 @@ function appendMetaSheet(workbook, className, subject, session, term) {
 
 function readMetaFromWorkbook(workbook) {
 
-    const result = { website_id: "", class_name: "", subject: "", session: "", term: "" };
+    const result = { website_id: "", class_name: "", subject: "", session: "", term: "", level: "" };
 
     if (!workbook || !workbook.Sheets || !workbook.Sheets["Meta"]) {
         return result;
@@ -11757,6 +12158,7 @@ function readMetaFromWorkbook(workbook) {
         if (key === "subject") result.subject = String(value || "").trim();
         if (key === "session") result.session = String(value || "").trim();
         if (key === "term") result.term = String(value || "").trim();
+        if (key === "level") result.level = String(value || "").trim();
     });
 
     return result;
@@ -11990,10 +12392,18 @@ async function downloadSubjectTemplate() {
                 f: `IF(COUNT(C${row}:E${row})=0,"",SUM(C${row}:E${row}))`
             };
         }
+        /* Level of the class this sheet belongs to (header only, so the
+           upload still reads the student rows exactly as before). */
+        const subjectSheetLevel = getClassLevel(className);
+
         subjectSheet["!ref"] = XLSX.utils.encode_range({
             s: { r: 0, c: 0 },
-            e: { r: rowCount, c: 6 }
+            e: { r: rowCount, c: subjectSheetLevel ? 7 : 6 }
         });
+
+        if (subjectSheetLevel) {
+            subjectSheet["H1"] = { t: "s", v: "Level: " + subjectSheetLevel };
+        }
 
         subjectSheet["!cols"] = [
             { wch: 7 },
@@ -12004,6 +12414,10 @@ async function downloadSubjectTemplate() {
             { wch: 10, hidden: true },
             { wch: 8 }
         ];
+
+        if (subjectSheetLevel) {
+            subjectSheet["!cols"].push({ wch: 18 });
+        }
 
         subjectSheet["!freeze"] = { xSplit: 3, ySplit: 1 };
 
@@ -12188,21 +12602,30 @@ async function downloadExcelTemplate() {
             return;
         }
 
-        schoolSubjects = schoolSubjects
-            .map(function (subject) { return String(subject).trim(); })
-            .filter(function (subject) { return subject !== ""; });
-
-        if (schoolSubjects.length === 0) {
-            alert("Please add at least one subject.");
-            return;
-        }
-
         const workbook = XLSX.utils.book_new();
 
         const templateContext = getWorkflowContext(true);
         if (!templateContext) return;
 
         const activeClassName = templateContext.className;
+
+        const templateLevel = getClassLevel(activeClassName);
+
+        /* Only the subjects of this class's level go into the template
+           (every subject when the class has no level yet). The school's
+           own list is left untouched. */
+        let templateSubjects = subjectsForClass(activeClassName)
+            .map(function (subject) { return String(subject).trim(); })
+            .filter(function (subject) { return subject !== ""; });
+
+        if (templateSubjects.length === 0) {
+            alert(
+                templateLevel
+                    ? "No subjects have been added for the " + templateLevel + " level yet. Add them in School Subjects first."
+                    : "Please add at least one subject."
+            );
+            return;
+        }
 
 
         /* =================================================
@@ -12232,7 +12655,7 @@ async function downloadExcelTemplate() {
             "House"
         ];
 
-        schoolSubjects.forEach(function (subject) {
+        templateSubjects.forEach(function (subject) {
             scoresHeaders.push(subject + " 1st CA");
             scoresHeaders.push(subject + " 2nd CA");
             scoresHeaders.push(subject + " Exams");
@@ -12249,7 +12672,7 @@ async function downloadExcelTemplate() {
         const savedScoresBySubject =
             await fetchAllSavedSubjectScoresForClass(
                 activeClassName,
-                schoolSubjects,
+                templateSubjects,
                 templateContext.session,
                 templateContext.term
             );
@@ -12287,7 +12710,7 @@ async function downloadExcelTemplate() {
                 rosterStudent ? rosterStudent.house : (i === 1 && masterRoster.length === 0 ? "Example House" : "")
             ];
 
-            schoolSubjects.forEach(function () {
+            templateSubjects.forEach(function () {
                 row.push("");
                 row.push("");
                 row.push("");
@@ -12326,7 +12749,7 @@ async function downloadExcelTemplate() {
             { wch: 12 }
         ];
 
-        schoolSubjects.forEach(function () {
+        templateSubjects.forEach(function () {
             scoresSheet["!cols"].push(
                 { wch: 9 },
                 { wch: 9 },
@@ -12373,7 +12796,8 @@ async function downloadExcelTemplate() {
             ["Grade D Minimum", reportSettings.gradeD],
             ["Grade E Minimum", reportSettings.gradeE],
             ["Grade F Minimum", reportSettings.gradeF],
-            ["Subjects", schoolSubjects.join(", ")],
+            ["Subjects", templateSubjects.join(", ")],
+            ["Level", templateLevel || "All levels"],
             ["Class", activeClassName]
         ];
 
@@ -12389,7 +12813,7 @@ async function downloadExcelTemplate() {
            ================================================= */
         const actualSubjectSheetNames = {};
 
-        schoolSubjects.forEach(function (subject) {
+        templateSubjects.forEach(function (subject) {
             const sheetName = getSubjectSheetName(subject, workbook);
             actualSubjectSheetNames[subject] = sheetName;
 
@@ -12483,7 +12907,7 @@ async function downloadExcelTemplate() {
            ================================================= */
         const subjectTotalLetters = [];
 
-        schoolSubjects.forEach(function (subject, subjectIndex) {
+        templateSubjects.forEach(function (subject, subjectIndex) {
             const sheetName = actualSubjectSheetNames[subject];
             const safeSheetName = sheetName.replace(/'/g, "''");
 
@@ -12530,7 +12954,7 @@ async function downloadExcelTemplate() {
            ================================================= */
         const firstSubjectColumn = 8;
         const lastSubjectColumn =
-            firstSubjectColumn + (schoolSubjects.length * 4) - 1;
+            firstSubjectColumn + (templateSubjects.length * 4) - 1;
         const overallTotalColumn = lastSubjectColumn + 1;
         const averageColumn = overallTotalColumn + 1;
         const positionColumn = averageColumn + 1;
@@ -12613,7 +13037,7 @@ async function downloadExcelTemplate() {
             (masterRoster.length > 0
                 ? masterRoster.length + " student(s) from the class list and "
                 : (rosterFetchFailed ? "⚠ (class list could not be loaded) " : "no class list and ")) +
-            schoolSubjects.length +
+            templateSubjects.length +
             " subject sheet(s)" +
             (mergedSubjectCount > 0
                 ? " (" + mergedSubjectCount + " of them pre-filled with previously saved scores)"
@@ -12838,10 +13262,13 @@ function handleExcelUpload(event) {
                     0
                 ) {
 
-                    schoolSubjects =
-                        detectedSubjects;
+                    /* A class's file only holds its own level's subjects, so
+                       keep the school's full list and just add anything new. */
+                    if (mergeDetectedSubjects(detectedSubjects)) {
 
-                    renderSubjectList();
+                        renderSubjectList();
+
+                    }
 
                 }
 
@@ -12853,7 +13280,9 @@ function handleExcelUpload(event) {
                 attachSubjectScores(
                     actualRows,
                     workbook,
-                    schoolSubjects
+                    detectedSubjects.length > 0
+                        ? detectedSubjects
+                        : schoolSubjects
                 );
 
 
@@ -13193,8 +13622,9 @@ function readSettings(
                     0
                 ) {
 
-                    schoolSubjects =
-                        importedSubjects;
+                    mergeDetectedSubjects(
+                        importedSubjects
+                    );
 
                 }
 
@@ -15963,6 +16393,10 @@ function createReport(student) {
                         )}
                     </td>
 
+                    <td class="remark-cell grade-${getGrade(subject.total)}">
+                        ${escapeHTML(getGradeRemark(getGrade(subject.total)))}
+                    </td>
+
                 </tr>
 
             `;
@@ -16418,6 +16852,10 @@ function createReport(student) {
                             Grade
                         </th>
 
+                        <th>
+                            Remark
+                        </th>
+
                     </tr>
 
                 </thead>
@@ -16438,7 +16876,7 @@ function createReport(student) {
                             OVERALL TOTAL
                         </th>
 
-                        <th colspan="2">
+                        <th colspan="3">
                             ${overallTotal.toFixed(2)}
                         </th>
 
@@ -16514,6 +16952,8 @@ function createReport(student) {
                 ${photoLayout.html}
 
             </div>
+
+            ${gradeKeyHtml(grade)}
 
 
             <!-- BEHAVIORAL TRAITS -->
@@ -16632,6 +17072,105 @@ function getGrade(
 
 
     return "F";
+
+}
+
+
+/* =========================================================
+   GRADE REMARKS + GRADING KEY
+
+   Each grade has a short remark shown next to it on the report.
+   Change the words here if the school prefers another wording
+   (for example "Good" for C or "Fair" for E).
+   ========================================================= */
+
+const GRADE_REMARKS = {
+    A: "Excellent",
+    B: "Very Good",
+    C: "Credit",
+    D: "Fairly Good",
+    E: "Pass",
+    F: "Failed"
+};
+
+function getGradeRemark(grade) {
+    return GRADE_REMARKS[grade] || "";
+}
+
+function formatGradeBound(value) {
+    const number = Number(value);
+    return Number.isInteger(number)
+        ? String(number)
+        : String(Math.round(number * 100) / 100);
+}
+
+/* The mark range that earns each grade, read from the school's
+   own Grade A-F minimums (Settings), never hard-coded. */
+function getGradeKeyRows() {
+
+    const s = reportSettings;
+
+    const totalMax =
+        (Number(s.firstCAMaximum) || 20) +
+        (Number(s.secondCAMaximum) || 20) +
+        (Number(s.examsMaximum) || 60);
+
+    const minimums = {
+        A: Number(s.gradeA),
+        B: Number(s.gradeB),
+        C: Number(s.gradeC),
+        D: Number(s.gradeD),
+        E: Number(s.gradeE),
+        F: Number(s.gradeF) || 0
+    };
+
+    const order = ["A", "B", "C", "D", "E", "F"];
+
+    return order.map(function (grade, index) {
+
+        const low = minimums[grade];
+        const above = index === 0 ? null : minimums[order[index - 1]];
+
+        let range;
+
+        if (above === null) {
+            range = formatGradeBound(low) + " - " + formatGradeBound(totalMax);
+        } else if (Number.isInteger(above)) {
+            range = formatGradeBound(low) + " - " + formatGradeBound(above - 1);
+        } else {
+            range = formatGradeBound(low) + " - below " + formatGradeBound(above);
+        }
+
+        return {
+            grade: grade,
+            remark: getGradeRemark(grade),
+            range: range
+        };
+
+    });
+
+}
+
+/* Shown under the Performance Summary; the student's own overall
+   grade is highlighted. */
+function gradeKeyHtml(currentGrade) {
+
+    const items = getGradeKeyRows().map(function (row) {
+        return `
+            <div class="grade-key-item${row.grade === currentGrade ? " is-current" : ""}">
+                <strong>${row.grade}</strong>
+                <span>${escapeHTML(row.remark)}</span>
+                <em>${escapeHTML(row.range)}</em>
+            </div>
+        `;
+    }).join("");
+
+    return `
+        <div class="grade-key">
+            <div class="grade-key-title">Grading Key (marks that earn each grade)</div>
+            <div class="grade-key-grid">${items}</div>
+        </div>
+    `;
 
 }
 
