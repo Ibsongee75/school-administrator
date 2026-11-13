@@ -79,6 +79,7 @@
 
   /* ---------- helpers ---------- */
   let sb = null;
+  let websiteId = null;   // only this website's rows are downloaded
   let syncing = false;
   const listeners = [];
 
@@ -233,6 +234,7 @@
         .order('updated_at', { ascending: true })
         .order(conflictCol(t), { ascending: true })
         .range(from, from + PAGE - 1);
+      if (websiteId) q = q.eq('website_id', websiteId);
       if (since) q = q.gte('updated_at', since);
       const { data, error } = await q;
       if (error) throw error;
@@ -260,7 +262,9 @@
     const ids = new Set();
     let from = 0, data;
     do {
-      const r = await sb.from(t).select(col).order(col, { ascending: true }).range(from, from + PAGE - 1);
+      let rq = sb.from(t).select(col).order(col, { ascending: true }).range(from, from + PAGE - 1);
+      if (websiteId) rq = rq.eq('website_id', websiteId);
+      const r = await rq;
       if (r.error) throw r.error;
       data = r.data || [];
       data.forEach(x => ids.add(x[col]));
@@ -298,8 +302,11 @@
     emit('idle');
   }
 
-  function init(client) {
+  function init(client, opts) {
     sb = client;
+    // Uses the page's WEBSITE_ID automatically, so two websites sharing one
+    // Supabase project never download each other's rows.
+    websiteId = (opts && opts.websiteId) || (typeof WEBSITE_ID !== 'undefined' ? WEBSITE_ID : null);
     window.addEventListener('online', sync);
     window.addEventListener('offline', () => emit('offline'));
     setInterval(sync, 60000);
