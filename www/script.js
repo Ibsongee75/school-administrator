@@ -97,11 +97,21 @@ function smClearOfflineUser() {
 }
 
 async function smBlockLogoutIfUnsynced() {
-    if ((await Offline.pending()) > 0) {
-        alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
+    const pending = await Offline.pending();
+    if (pending === 0) return false;
+
+    const f = await Offline.failures();
+    if (f.length === pending) {
+        // everything left was rejected by the server
+        if (confirm("The server rejected these changes, so they cannot sync:\n\n" +
+                    f.join("\n") + "\n\nDiscard them and log out?")) {
+            await Offline.discardFailed();
+            return false;
+        }
         return true;
     }
-    return false;
+    alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
+    return true;
 }
 
 
