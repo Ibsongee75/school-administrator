@@ -97,21 +97,27 @@ function smClearOfflineUser() {
 }
 
 async function smBlockLogoutIfUnsynced() {
-    const pending = await Offline.pending();
-    if (pending === 0) return false;
+    try {
+        const pending = await Offline.pending();
+        if (pending === 0) return false;
 
-    const f = await Offline.failures();
-    if (f.length === pending) {
-        // everything left was rejected by the server
-        if (confirm("The server rejected these changes, so they cannot sync:\n\n" +
-                    f.join("\n") + "\n\nDiscard them and log out?")) {
-            await Offline.discardFailed();
-            return false;
+        if (typeof Offline.failures === "function" && typeof Offline.discardFailed === "function") {
+            const f = await Offline.failures();
+            if (f.length && f.length === pending) {
+                if (window.confirm("The server rejected these changes, so they cannot sync:\n\n" +
+                                   f.join("\n") + "\n\nDiscard them and log out?")) {
+                    await Offline.discardFailed();
+                    return false;
+                }
+                return true;
+            }
         }
+        alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
         return true;
+    } catch (e) {
+        console.error(e);
+        return false; // if the check itself breaks, don't trap the user
     }
-    alert("Some changes have not synced yet. Connect to the internet and wait for sync to finish before logging out.");
-    return true;
 }
 
 

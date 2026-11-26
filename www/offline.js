@@ -329,5 +329,5 @@ async function discardFailed() {
   return bad.length;
 }
   
-  window.Offline = { init, list, save, remove, upsertManyByKey, removeWhere, sync, clearAll, onStatus: fn => listeners.push(fn), pending: pendingCount };
+  window.Offline = { init, list, save, remove, upsertManyByKey, removeWhere, sync, clearAll, onStatus: fn => listeners.push(fn), pending: pendingCount, failures, discardFailed };
 })();
